@@ -1,6 +1,6 @@
 """
 多模态推荐系统数据加载脚本
-使用 Amazon Reviews 2023 数据集 (All_Beauty 分类)
+使用本地 Amazon Reviews 2023 数据集 (All_Beauty 分类)
 
 输出: PyTorch DataLoader
 - user_id: 用户ID
@@ -10,15 +10,20 @@
 - rating: 评分 (作为Label)
 """
 
-import datasets
+import json
+import pandas as pd
 import torch
-from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Any, Optional
-import pandas as pd
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+from transformers import AutoTokenizer
 
-# 忽略 datasets 库的不必要输出
-datasets.logging.set_verbosity_error()
+# 初始化全局 tokenizer
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+# 数据目录
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class AmazonMultimodalDataset(Dataset):
@@ -61,24 +66,24 @@ class AmazonMultimodalDataset(Dataset):
         
         # 获取用户ID和商品ID
         user_id = row['user_id']
-        item_id = row['parent_asin']  # 使用 parent_asin 作为 item_id
+        item_id = row['parent_asin']
         
         # 获取评论文本 (text 字段)
-        text_raw = row.get('text', '') or ''
+        text_raw = str(row.get('text', '')) if pd.notna(row.get('text', '')) else ''
         
         # 从 Metadata 获取图片URL
         image_url = None
         if item_id in self.metadata_dict:
             meta = self.metadata_dict[item_id]
-            images = meta.get('images', {})
-            if images and isinstance(images, dict):
-                # 优先获取 hi_res，然后是 large，最后是 thumb
-                for key in ['hi_res', 'large', 'thumb']:
-                    if key in images and images[key]:
-                        # 取第一张图片
-                        url = images[key][0] if isinstance(images[key], list) else images[key]
-                        if url is not None:
-                            image_url = url
+            images = meta.get('images', [])
+            if images and isinstance(images, list) and len(images) > 0:
+                # 取第一张图片
+                first_image = images[0]
+                if isinstance(first_image, dict):
+                    # 优先获取 hi_res，然后是 large，最后是 thumb
+                    for key in ['hi_res', 'large', 'thumb']:
+                        if key in first_image and first_image[key]:
+                            image_url = first_image[key]
                             break
         
         # 获取评分
@@ -103,67 +108,84 @@ def collate_fn(batch):
     Returns:
         打包后的 batch 字典
     """
+    # 提取 user_id 和 item_id 列表
+    user_ids = [item['user_id'] for item in batch]
+    item_ids = [item['item_id'] for item in batch]
+    
+    # 提取文本列表
+    text_list = [item['text_raw'] for item in batch]
+    
+    # 使用 tokenizer 处理文本
+    encoded = tokenizer(
+        text_list,
+        padding=True,
+        truncation=True,
+        max_length=128,
+        return_tensors="pt"
+    )
+    
+    # 获取其他字段
+    image_urls = [item['image_url'] for item in batch]
+    ratings = torch.tensor([item['rating'] for item in batch], dtype=torch.float32)
+    
     return {
-        'user_id': [item['user_id'] for item in batch],
-        'item_id': [item['item_id'] for item in batch],
-        'text_raw': [item['text_raw'] for item in batch],
-        'image_url': [item['image_url'] for item in batch],
-        'rating': torch.tensor([item['rating'] for item in batch], dtype=torch.float32)
+        'user_id': user_ids,
+        'item_id': item_ids,
+        'input_ids': encoded['input_ids'],
+        'attention_mask': encoded['attention_mask'],
+        'image_url': image_urls,
+        'rating': ratings
     }
 
 
-def load_amazon_reviews_2023(
-    category: str = "All_Beauty",
-    max_samples: Optional[int] = None,
-    sample_ratio: float = 1.0
-) -> tuple:
+def load_jsonl(filepath: str, max_lines: Optional[int] = None) -> list:
     """
-    加载 Amazon Reviews 2023 数据集的 Reviews 和 Item Metadata
+    逐行加载 JSONL 文件
     
     Args:
-        category: 商品分类 (默认: All_Beauty)
+        filepath: 文件路径
+        max_lines: 最大行数 (None 表示全部)
+        
+    Returns:
+        字典列表
+    """
+    data = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if max_lines is not None and i >= max_lines:
+                break
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+    return data
+
+
+def load_local_amazon_data(
+    reviews_file: str = "All_Beauty.jsonl",
+    metadata_file: str = "meta_All_Beauty.jsonl",
+    max_samples: Optional[int] = None
+) -> tuple:
+    """
+    加载本地的 Amazon Reviews 2023 数据集
+    
+    Args:
+        reviews_file: Reviews 数据文件名
+        metadata_file: Metadata 数据文件名
         max_samples: 最大样本数 (默认: None, 加载全部)
-        sample_ratio: 采样比例 (0-1之间)
         
     Returns:
         (reviews_df, metadata_dict)
     """
-    print(f"正在加载 {category} 分类的 Reviews 数据...")
+    reviews_path = os.path.join(DATA_DIR, reviews_file)
+    metadata_path = os.path.join(DATA_DIR, metadata_file)
     
-    # 加载 Reviews 数据
-    reviews_dataset = load_dataset(
-        "McAuley-Lab/Amazon-Reviews-2023",
-        f"raw_review_{category}",
-        trust_remote_code=True
-    )
-    reviews_full = reviews_dataset["full"]
-    
-    # 转换为 DataFrame
-    reviews_df = reviews_full.to_pandas()
+    print(f"正在加载 Reviews 数据: {reviews_path}")
+    reviews_list = load_jsonl(reviews_path, max_lines=max_samples)
+    reviews_df = pd.DataFrame(reviews_list)
     print(f"  Reviews 数据加载完成，共 {len(reviews_df)} 条")
     
-    # 根据 max_samples 截取
-    if max_samples is not None and max_samples < len(reviews_df):
-        reviews_df = reviews_df.head(max_samples)
-        print(f"  截取前 {max_samples} 条数据")
-    
-    # 根据 sample_ratio 采样
-    if sample_ratio < 1.0:
-        reviews_df = reviews_df.sample(frac=sample_ratio, random_state=42).reset_index(drop=True)
-        print(f"  采样比例 {sample_ratio}，剩余 {len(reviews_df)} 条数据")
-    
-    print(f"正在加载 {category} 分类的 Item Metadata...")
-    
-    # 加载 Item Metadata
-    metadata_dataset = load_dataset(
-        "McAuley-Lab/Amazon-Reviews-2023",
-        f"raw_meta_{category}",
-        split="full",
-        trust_remote_code=True
-    )
-    
-    # 转换为字典 {parent_asin: metadata}
-    metadata_list = metadata_dataset.to_list()
+    print(f"正在加载 Metadata 数据: {metadata_path}")
+    metadata_list = load_jsonl(metadata_path)
     metadata_dict = {item['parent_asin']: item for item in metadata_list}
     print(f"  Metadata 加载完成，共 {len(metadata_dict)} 个商品")
     
@@ -204,10 +226,8 @@ def create_dataloader(
 
 
 def preprocess_and_create_dataloader(
-    category: str = "All_Beauty",
     batch_size: int = 32,
     max_samples: Optional[int] = None,
-    sample_ratio: float = 1.0,
     shuffle: bool = True,
     num_workers: int = 0
 ) -> DataLoader:
@@ -215,10 +235,8 @@ def preprocess_and_create_dataloader(
     一站式函数：加载数据并创建 DataLoader
     
     Args:
-        category: 商品分类
         batch_size: Batch 大小
         max_samples: 最大样本数
-        sample_ratio: 采样比例
         shuffle: 是否打乱
         num_workers: 数据加载线程数
         
@@ -226,10 +244,8 @@ def preprocess_and_create_dataloader(
         PyTorch DataLoader
     """
     # 加载数据
-    reviews_df, metadata_dict = load_amazon_reviews_2023(
-        category=category,
-        max_samples=max_samples,
-        sample_ratio=sample_ratio
+    reviews_df, metadata_dict = load_local_amazon_data(
+        max_samples=max_samples
     )
     
     # 创建 DataLoader
@@ -246,12 +262,10 @@ def preprocess_and_create_dataloader(
 
 # 示例用法
 if __name__ == "__main__":
-    # 加载少量数据作为示例 (100条，采样1%)
+    # 加载100条数据作为示例
     dataloader = preprocess_and_create_dataloader(
-        category="All_Beauty",
         batch_size=4,
         max_samples=100,
-        sample_ratio=0.01,
         shuffle=True
     )
     
@@ -262,7 +276,8 @@ if __name__ == "__main__":
         print("\n=== Batch 示例 ===")
         print(f"user_id: {batch['user_id']}")
         print(f"item_id: {batch['item_id']}")
-        print(f"text_raw (前100字符): {[t[:100] + '...' if len(t) > 100 else t for t in batch['text_raw']]}")
+        print(f"input_ids shape: {batch['input_ids'].shape}")
+        print(f"input_ids (第一个样本前10个数字): {batch['input_ids'][0][:10]}")
         print(f"image_url: {batch['image_url']}")
         print(f"rating: {batch['rating']}")
         print(f"rating shape: {batch['rating'].shape}")
