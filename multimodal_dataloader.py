@@ -17,11 +17,36 @@ from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Any, Optional
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BertModel
 
 # 初始化全局 tokenizer
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 
+# 自动检测设备：有 GPU 用 GPU，没有则用 CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"当前使用的设备: {device}")
+
+# 将模型加载到对应设备上
+bert_model = BertModel.from_pretrained("bert-base-uncased").to(device)
+bert_model.eval()
+
+
+
+def get_text_embedding(input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    """
+    获取 BERT 最后一层的 [CLS] 向量
+    """
+    # 1. 切换到评估模式（关闭 Dropout）
+    bert_model.eval()
+
+    # 2. 关闭梯度计算（省内存，提速度）
+    with torch.no_grad():
+        # 同时传入 mask 才是完整的 BERT 调用
+        outputs = bert_model(input_ids=input_ids, attention_mask=attention_mask)
+
+    # 取第一个向量 [CLS]，形状为 (batch_size, 768)
+    cls_embedding = outputs.last_hidden_state[:, 0, :]
+    return cls_embedding
 # 数据目录
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -135,7 +160,7 @@ def collate_fn(batch):
         'attention_mask': encoded['attention_mask'],
         'image_url': image_urls,
         'rating': ratings
-    }
+   }
 
 
 def load_jsonl(filepath: str, max_lines: Optional[int] = None) -> list:
@@ -277,7 +302,11 @@ if __name__ == "__main__":
         print(f"user_id: {batch['user_id']}")
         print(f"item_id: {batch['item_id']}")
         print(f"input_ids shape: {batch['input_ids'].shape}")
-        print(f"input_ids (第一个样本前10个数字): {batch['input_ids'][0][:10]}")
+        print(f"attention_mask shape: {batch['attention_mask'].shape}")
+
+        # 修改调用方式，传入 mask
+        cls_embedding = get_text_embedding(batch['input_ids'], batch['attention_mask'])
+        print(f"[CLS] embedding shape: {cls_embedding.shape}")
         print(f"image_url: {batch['image_url']}")
         print(f"rating: {batch['rating']}")
         print(f"rating shape: {batch['rating'].shape}")
