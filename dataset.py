@@ -1,0 +1,291 @@
+"""
+数据集模块
+负责数据加载、预处理和 DataLoader 创建
+"""
+
+import json
+import pandas as pd
+import torch
+from torch.utils.data import DataLoader, Dataset
+from typing import Dict, Any, Optional
+
+from config import (
+    DATA_DIR,
+    tokenizer,
+    load_image_tensor,
+    get_image_placeholder,
+    MAX_TEXT_LENGTH
+)
+
+
+def load_jsonl(filepath: str, max_lines: Optional[int] = None) -> list:
+    """
+    逐行加载 JSONL 文件
+    
+    Args:
+        filepath: 文件路径
+        max_lines: 最大行数 (None 表示全部)
+        
+    Returns:
+        字典列表
+    """
+    data = []
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if max_lines is not None and i >= max_lines:
+                break
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+    return data
+
+
+def load_local_amazon_data(
+    reviews_file: str = "All_Beauty.jsonl",
+    metadata_file: str = "meta_All_Beauty.jsonl",
+    max_samples: Optional[int] = None
+) -> tuple:
+    """
+    加载本地的 Amazon Reviews 2023 数据集
+    
+    Args:
+        reviews_file: Reviews 数据文件名
+        metadata_file: Metadata 数据文件名
+        max_samples: 最大样本数 (默认: None, 加载全部)
+        
+    Returns:
+        (reviews_df, metadata_dict)
+    """
+    import os
+    reviews_path = os.path.join(DATA_DIR, reviews_file)
+    metadata_path = os.path.join(DATA_DIR, metadata_file)
+    
+    print(f"正在加载 Reviews 数据: {reviews_path}")
+    reviews_list = load_jsonl(reviews_path, max_lines=max_samples)
+    reviews_df = pd.DataFrame(reviews_list)
+    print(f"  Reviews 数据加载完成，共 {len(reviews_df)} 条")
+    
+    print(f"正在加载 Metadata 数据: {metadata_path}")
+    metadata_list = load_jsonl(metadata_path)
+    metadata_dict = {item['parent_asin']: item for item in metadata_list}
+    print(f"  Metadata 加载完成，共 {len(metadata_dict)} 个商品")
+    
+    return reviews_df, metadata_dict
+
+
+class AmazonMultimodalDataset(Dataset):
+    """
+    多模态推荐数据集
+    支持文本(评论)和图像(商品图片URL)两种模态
+    """
+    
+    def __init__(
+        self, 
+        reviews_data: pd.DataFrame, 
+        metadata_dict: Dict[str, Dict[str, Any]]
+    ):
+        """
+        初始化数据集
+        
+        Args:
+            reviews_data: Reviews 数据 (DataFrame)
+            metadata_dict: Metadata 字典 {parent_asin: metadata_dict}
+        """
+        self.reviews_data = reviews_data.reset_index(drop=True)
+        self.metadata_dict = metadata_dict
+        
+    def __len__(self) -> int:
+        return len(self.reviews_data)
+    
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        获取单个样本
+        
+        Returns:
+            包含以下字段的字典:
+            - user_id: 用户ID
+            - item_id: 商品ID (parent_asin)
+            - text_raw: 原始评论文本
+            - image_url: 商品图片URL (若无则为None)
+            - rating: 评分 (float)
+        """
+        row = self.reviews_data.iloc[idx]
+        
+        # 获取用户ID和商品ID
+        user_id = row['user_id']
+        item_id = row['parent_asin']
+        
+        # 获取评论文本 (text 字段)
+        text_raw = str(row.get('text', '')) if pd.notna(row.get('text', '')) else ''
+        
+        # 从 Metadata 获取图片URL
+        image_url = None
+        if item_id in self.metadata_dict:
+            meta = self.metadata_dict[item_id]
+            images = meta.get('images', [])
+            if images and isinstance(images, list) and len(images) > 0:
+                first_image = images[0]
+                if isinstance(first_image, dict):
+                    for key in ['hi_res', 'large', 'thumb']:
+                        if key in first_image and first_image[key]:
+                            image_url = first_image[key]
+                            break
+        
+        # 获取评分
+        rating = float(row.get('rating', 0.0))
+        
+        return {
+            'user_id': user_id,
+            'item_id': item_id,
+            'text_raw': text_raw,
+            'image_url': image_url,
+            'rating': rating
+        }
+
+
+def collate_fn(batch):
+    """
+    自定义 collate 函数，处理 batch 中的数据
+    
+    在这里完成所有预处理：
+    1. 文本 tokenization
+    2. 图片下载和预处理
+    
+    Args:
+        batch: 样本列表
+        
+    Returns:
+        打包后的 batch 字典，包含可直接喂给模型的 Tensor
+    """
+    # 提取基本字段
+    user_ids = [item['user_id'] for item in batch]
+    item_ids = [item['item_id'] for item in batch]
+    text_list = [item['text_raw'] for item in batch]
+    ratings = torch.tensor([item['rating'] for item in batch], dtype=torch.float32)
+    
+    # 1. 文本 tokenization
+    encoded = tokenizer(
+        text_list,
+        padding=True,
+        truncation=True,
+        max_length=MAX_TEXT_LENGTH,
+        return_tensors="pt"
+    )
+    input_ids = encoded['input_ids']
+    attention_mask = encoded['attention_mask']
+    
+    # 2. 图片下载和预处理
+    image_tensors = []
+    for item in batch:
+        url = item['image_url']
+        if url is not None:
+            try:
+                img_tensor = load_image_tensor(url)
+            except Exception:
+                img_tensor = get_image_placeholder()
+        else:
+            img_tensor = get_image_placeholder()
+        image_tensors.append(img_tensor)
+    
+    # 堆叠成 batch: (batch_size, 3, 224, 224)
+    image_tensors = torch.stack(image_tensors)
+    
+    return {
+        'user_id': user_ids,
+        'item_id': item_ids,
+        'input_ids': input_ids,
+        'attention_mask': attention_mask,
+        'image_tensors': image_tensors,
+        'rating': ratings
+    }
+
+
+def create_dataloader(
+    reviews_df: pd.DataFrame,
+    metadata_dict: Dict[str, Dict[str, Any]],
+    batch_size: int = 32,
+    shuffle: bool = True,
+    num_workers: int = 0
+) -> DataLoader:
+    """
+    创建 PyTorch DataLoader
+    
+    Args:
+        reviews_df: Reviews 数据 DataFrame
+        metadata_dict: Metadata 字典
+        batch_size: Batch 大小
+        shuffle: 是否打乱
+        num_workers: 数据加载线程数
+        
+    Returns:
+        PyTorch DataLoader
+    """
+    dataset = AmazonMultimodalDataset(reviews_df, metadata_dict)
+    
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn
+    )
+    
+    return dataloader
+
+
+def preprocess_and_create_dataloader(
+    batch_size: int = 32,
+    max_samples: Optional[int] = None,
+    shuffle: bool = True,
+    num_workers: int = 0
+) -> DataLoader:
+    """
+    一站式函数：加载数据并创建 DataLoader
+    
+    Args:
+        batch_size: Batch 大小
+        max_samples: 最大样本数
+        shuffle: 是否打乱
+        num_workers: 数据加载线程数
+        
+    Returns:
+        PyTorch DataLoader
+    """
+    # 加载数据
+    reviews_df, metadata_dict = load_local_amazon_data(
+        max_samples=max_samples
+    )
+    
+    # 创建 DataLoader
+    dataloader = create_dataloader(
+        reviews_df=reviews_df,
+        metadata_dict=metadata_dict,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers
+    )
+    
+    return dataloader
+
+
+# 示例用法
+if __name__ == "__main__":
+    # 加载数据作为示例
+    dataloader = preprocess_and_create_dataloader(
+        batch_size=4,
+        max_samples=100,
+        shuffle=True
+    )
+    
+    print(f"\nDataLoader 创建成功！共有 {len(dataloader)} 个 batches")
+    
+    # 测试读取一个 batch
+    for batch in dataloader:
+        print("\n=== Batch 示例 ===")
+        print(f"user_id: {batch['user_id']}")
+        print(f"item_id: {batch['item_id']}")
+        print(f"input_ids shape: {batch['input_ids'].shape}")         # (4, 128)
+        print(f"attention_mask shape: {batch['attention_mask'].shape}") # (4, 128)
+        print(f"image_tensors shape: {batch['image_tensors'].shape}")   # (4, 3, 224, 224)
+        print(f"rating shape: {batch['rating'].shape}")                 # (4,)
+        break
