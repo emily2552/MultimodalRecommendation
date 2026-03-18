@@ -16,6 +16,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from typing import Dict, Any, Optional
 import os
+import requests
+from PIL import Image
+from io import BytesIO
+import torchvision.transforms as transforms
+import torchvision.models as models
+
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 from transformers import AutoTokenizer, BertModel
 
@@ -26,9 +32,31 @@ tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"当前使用的设备: {device}")
 
-# 将模型加载到对应设备上
+# 将文本处理模型加载到对应设备上
 bert_model = BertModel.from_pretrained("bert-base-uncased").to(device)
-bert_model.eval()
+bert_model.eval() # 推理模式，告诉bert现在不是学习时间，请保持稳定，直接给结果。
+
+# 加载预训练的 ResNet50 模型-图像处理
+resnet_model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1).to(device)
+resnet_model.eval()
+
+# 定义图像预处理 transform (ImageNet 标准)
+image_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(224), # 中心裁剪
+    # 3. 转为张量：将 PIL 图片或 numpy 数组转换为 PyTorch Tensor
+    # 动作：将像素值从 [0, 255] 归一化到 [0.0, 1.0] 之间，并调整维度为 (C, H, W)
+    transforms.ToTensor(),
+    # 4. 标准化：使用 ImageNet 数据集的均值和标准差进行归一化
+    # 算式：output = (input - mean) / std
+    # 目的：让输入数据的分布更接近正态分布，加速模型收敛（这是 ResNet 预训练时的标配参数）
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# 返回结果类型：torch.Tensor
+# 形状：(C, H, W) = (3, 224, 224)
+# 数据类型：torch.float32
+# 值域：经过标准化后的浮点数（不是 [0,1]，而是均值为 0，标准差为 1 的分布）
 
 
 
@@ -47,7 +75,56 @@ def get_text_embedding(input_ids: torch.Tensor, attention_mask: torch.Tensor) ->
     # 取第一个向量 [CLS]，形状为 (batch_size, 768)
     cls_embedding = outputs.last_hidden_state[:, 0, :]
     return cls_embedding
-# 数据目录
+
+
+def get_image_embedding(image_urls: list) -> torch.Tensor:
+    """
+    下载图片并提取 ResNet50 特征向量（视觉特征提取核心部分）
+    
+    Args:
+        image_urls: 图片 URL 列表
+        
+    Returns:
+        视觉特征向量，形状为 (batch_size, 2048)
+    """
+    resnet_model.eval()
+    
+    images = []
+    valid_indices = []
+    
+    with torch.no_grad():
+        for i, url in enumerate(image_urls):
+            if url is None:
+                # 如果没有图片，创建一个全零的占位符
+                images.append(torch.zeros(3, 224, 224))
+                valid_indices.append(i)
+            else:
+                try:
+                    # 下载图片
+                    response = requests.get(url, timeout=10)
+                    response.raise_for_status()
+                    img = Image.open(BytesIO(response.content)).convert('RGB')
+                    
+                    # 转换为张量并预处理
+                    img_tensor = image_transform(img)
+                    images.append(img_tensor)
+                    valid_indices.append(i)
+                except Exception as e:
+                    # 下载失败时使用占位符
+                    print(f"Warning: Failed to download image {url}: {e}")
+                    images.append(torch.zeros(3, 224, 224))
+                    valid_indices.append(i)
+        
+        # 堆叠成 batch
+        if len(images) > 0:
+            image_batch = torch.stack(images).to(device)
+        else:
+            return torch.empty(0, 2048).to(device)
+        
+        # 提取特征 (移除最后的分类层)
+        features = resnet_model(image_batch)
+    
+    return features
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -305,8 +382,13 @@ if __name__ == "__main__":
         print(f"attention_mask shape: {batch['attention_mask'].shape}")
 
         # 修改调用方式，传入 mask
-        cls_embedding = get_text_embedding(batch['input_ids'], batch['attention_mask'])
-        print(f"[CLS] embedding shape: {cls_embedding.shape}")
+        # cls_embedding = get_text_embedding(batch['input_ids'], batch['attention_mask'])
+        # print(f"[CLS] embedding shape: {cls_embedding.shape}")
+        
+        # 获取图像特征
+        # image_embedding = get_image_embedding(batch['image_url'])
+        # print(f"Image embedding shape: {image_embedding.shape}")
+        
         print(f"image_url: {batch['image_url']}")
         print(f"rating: {batch['rating']}")
         print(f"rating shape: {batch['rating'].shape}")
